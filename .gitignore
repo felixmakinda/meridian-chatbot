@@ -1,0 +1,21 @@
+# Secrets
+*.tfvars
+.env
+.env.local
+frontend/.env.local
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+crash.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Node
+frontend/node_modules/
+frontend/.next/
