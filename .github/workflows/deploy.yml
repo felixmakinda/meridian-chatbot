@@ -1,4 +1,4 @@
-name: Deploy to AWS ECS
+name: Deploy to AWS
 
 on:
   push:
@@ -6,11 +6,10 @@ on:
 
 env:
   AWS_REGION: eu-west-1
-  ECS_CLUSTER: meridian-chatbot-cluster
 
 jobs:
   deploy-api:
-    name: Build & deploy API
+    name: Build & deploy API (AppRunner)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,16 +36,10 @@ jobs:
             ./app
           docker push $REGISTRY/meridian-chatbot:$IMAGE_TAG
           docker push $REGISTRY/meridian-chatbot:latest
-
-      - name: Force ECS redeployment
-        run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service meridian-chatbot-svc \
-            --force-new-deployment
+      # AppRunner watches ECR and redeploys automatically on new :latest push
 
   deploy-ui:
-    name: Build & deploy UI
+    name: Build & deploy UI (S3 + CloudFront)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,32 +51,39 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: latest
 
-      - name: Build and push UI image
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-          NEXT_PUBLIC_API_URL: ${{ secrets.API_URL }}
-        run: |
-          docker build \
-            --build-arg NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
-            -t $REGISTRY/meridian-chatbot-ui:$IMAGE_TAG \
-            -t $REGISTRY/meridian-chatbot-ui:latest \
-            ./frontend
-          docker push $REGISTRY/meridian-chatbot-ui:$IMAGE_TAG
-          docker push $REGISTRY/meridian-chatbot-ui:latest
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - name: Force ECS redeployment
+      - name: Install dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static export
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.API_URL }}
+        run: pnpm build
+
+      - name: Sync to S3
         run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service meridian-chatbot-ui-svc \
-            --force-new-deployment
+          aws s3 sync frontend/out s3://${{ secrets.S3_BUCKET }} \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable"
+          # HTML files must not be cached long-term
+          aws s3 cp frontend/out/index.html s3://${{ secrets.S3_BUCKET }}/index.html \
+            --cache-control "no-cache"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
