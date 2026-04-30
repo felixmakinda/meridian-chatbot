@@ -2,27 +2,27 @@
 
 ## Business Problem
 Meridian Electronics' support team handles all customer inquiries manually via phone and email.
-This prototype automates the four most common workflows using an AI chatbot connected to existing
-backend systems via MCP — no direct database access required.
+This prototype automates the four most common workflows — product browsing, stock checks,
+order history, and order placement — using an AI chatbot connected to existing backend systems
+via MCP, with no direct database access.
 
 ---
 
-## High-Level Architecture
+## System Architecture
 
 ```mermaid
 flowchart TD
-    Customer([Customer]) -->|chat message| UI[Next.js Chat UI\nfrontend/]
-    UI -->|POST /chat + session_id| API[FastAPI Backend\napp/main.py]
-    API -->|user message + history| Engine[Chat Engine\napp/chatbot.py]
-    Engine -->|messages + tools| LLM{LLM}
-    LLM -->|primary| OAI[OpenAI\ngpt-4o-mini]
-    LLM -->|fallback on error| OR[OpenRouter\ngpt-4o-mini]
-    OAI -->|tool_call| Engine
-    OR -->|tool_call| Engine
-    Engine -->|JSON-RPC POST| MCP[MCP Server\norder-mcp on Cloud Run]
-    MCP -->|tool result| Engine
-    Engine -->|final response| API
-    API -->|reply + session_id| UI
+    Customer([Customer]) -->|HTTPS| CF[CloudFront CDN]
+    CF -->|serves static files| S3[S3 Bucket\nNext.js static export]
+
+    Customer -->|POST /chat| AR[AWS AppRunner\nFastAPI API]
+
+    AR -->|tool calls| CB[chatbot.py\nOpenAI tool loop]
+    CB -->|primary| OAI[OpenAI\ngpt-4o-mini]
+    CB -->|fallback on error| OR[OpenRouter\ngpt-4o-mini]
+    OAI & OR -->|tool_call| MC[mcp_client.py]
+    MC -->|JSON-RPC POST| MCP[MCP Server\norder-mcp on Cloud Run]
+    MCP -->|tool result| MC
 ```
 
 ---
@@ -31,28 +31,42 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph Frontend["frontend/ — Next.js"]
+    subgraph Frontend["frontend/  —  Next.js + pnpm"]
         P[page.tsx\nChat UI + session state]
+        L[layout.tsx]
+        G[globals.css\nTailwind CSS]
     end
 
-    subgraph Backend["app/ — FastAPI"]
-        M[main.py\nREST API + session store]
-        C[chatbot.py\nOpenAI tool loop\n+ OpenRouter fallback]
+    subgraph Backend["app/  —  FastAPI + uv"]
+        M[main.py\nREST API + in-memory session store]
+        C[chatbot.py\nOpenAI tool loop + OpenRouter fallback]
         MC[mcp_client.py\nHTTP JSON-RPC client]
     end
 
-    subgraph External
-        OAI[OpenAI API\ngpt-4o-mini]
-        OR[OpenRouter API\nopenai/gpt-4o-mini]
-        MCP[MCP Server\norder-mcp]
+    subgraph AWS
+        CF[CloudFront]
+        S3[S3]
+        AR[AppRunner]
+        ECR[ECR]
     end
 
-    P -->|POST /chat| M
+    subgraph External
+        OAI[OpenAI API]
+        OR[OpenRouter API]
+        MCP[order-mcp\nCloud Run]
+    end
+
+    P --> M
     M --> C
-    C -->|primary| OAI
-    C -->|fallback| OR
+    C --> OAI
+    C --> OR
     C --> MC
-    MC -->|POST /mcp| MCP
+    MC --> MCP
+
+    Frontend -->|static export| S3
+    S3 --> CF
+    Backend -->|Docker image| ECR
+    ECR --> AR
 ```
 
 ---
@@ -74,7 +88,7 @@ sequenceDiagram
     Bot->>MCP: list_orders(customer_id)
     MCP-->>Bot: order list
     Bot->>C: displays order history
-    note over Bot: customer_id reused for\nall subsequent requests
+    note over Bot: customer_id reused for all<br/>subsequent requests — no re-auth
 ```
 
 ---
@@ -95,7 +109,7 @@ sequenceDiagram
     Bot->>MCP: get_product("MON-0056")
     MCP-->>Bot: confirmed price $484.14, stock 32
     Bot->>C: "Confirm order for $484.14?"
-    C->>Bot: "Yes"
+    C->>Bot: "Yes, confirm"
     Bot->>MCP: create_order(customer_id, items)
     MCP-->>Bot: order confirmation + order ID
     Bot->>C: order confirmed
@@ -107,13 +121,13 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    Req[API Request] --> OAI[Try OpenAI\ngpt-4o-mini]
-    OAI -->|success| Resp[Response]
-    OAI -->|RateLimitError\nTimeoutError\nConnectionError\n5xx| OR[Retry OpenRouter\nopenai/gpt-4o-mini]
-    OR --> Resp
+    Req[Chat Request] --> OAI[OpenAI\ngpt-4o-mini]
+    OAI -->|success| Res[Response]
+    OAI -->|RateLimitError\nTimeoutError\nConnectionError\n5xx| OR[OpenRouter\ngpt-4o-mini]
+    OR --> Res
 ```
 
-Both providers serve the same `gpt-4o-mini` model. OpenRouter acts as a transparent hot-standby — no prompt or tool definition changes needed.
+Same model on both providers — OpenRouter is a transparent hot-standby with no prompt or tool changes needed.
 
 ---
 
@@ -132,42 +146,39 @@ Both providers serve the same `gpt-4o-mini` model. OpenRouter acts as a transpar
 
 ---
 
-## CI/CD & Deployment
+## CI/CD Pipeline
 
 ```mermaid
 flowchart TD
     Dev[git push main] --> GHA[GitHub Actions]
 
-    GHA -->|job: deploy-api\ndocker build uv| ECR_API[ECR\nmeridian-chatbot]
-    GHA -->|job: deploy-ui\ndocker build pnpm| ECR_UI[ECR\nmeridian-chatbot-ui]
+    GHA --> A[Job: deploy-api]
+    GHA --> B[Job: deploy-ui]
 
-    ECR_API --> ECS_API[ECS Fargate\nFastAPI — port 8000]
-    ECR_UI  --> ECS_UI[ECS Fargate\nNext.js — port 3000]
+    A -->|docker build\nuv install| ECR[AWS ECR]
+    ECR -->|auto-deploy| AR[AWS AppRunner]
 
-    ECS_API --> ALB[Application Load Balancer]
-    ECS_UI  --> ALB
-
-    ALB --> Internet([Public URL])
+    B -->|pnpm install\npnpm build| OUT[Next.js static export\nout/]
+    OUT -->|aws s3 sync| S3[AWS S3]
+    S3 -->|cache invalidation| CF[AWS CloudFront]
 ```
 
-### Package managers
-| Layer | Tool |
-|---|---|
-| Python backend | `uv` — fast dependency install in Docker |
-| Node.js frontend | `pnpm` — fast, strict, deterministic |
+---
 
-### GitHub Actions secrets required
-| Secret | Value |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | aiengineer IAM key |
-| `AWS_SECRET_ACCESS_KEY` | aiengineer IAM secret |
-| `API_URL` | ALB DNS of the backend e.g. `http://meridian-chatbot-alb-xxx.eu-west-1.elb.amazonaws.com` |
+## Infrastructure (Terraform)
 
-### Infrastructure (Terraform)
 | Resource | Purpose |
 |---|---|
-| ECR (×2) | Docker image registries for API and UI |
-| ECS Fargate (×2) | Serverless containers — API and UI services |
-| ALB | Single public endpoint, routes to both services |
-| IAM | Task execution role + task role (Bedrock-style scoping) |
-| CloudWatch | Container logs, 7-day retention |
+| **ECR** | Docker image registry for the FastAPI backend |
+| **AppRunner** | Serverless container runtime — auto-scales, no ALB or VPC config needed |
+| **S3** | Private bucket for Next.js static files |
+| **CloudFront** | CDN — serves frontend over HTTPS globally, SPA routing via custom error pages |
+| **IAM** | AppRunner access role scoped to ECR pull only |
+| **CloudWatch** | Container logs with 7-day retention |
+
+## Package Managers
+
+| Layer | Tool | Why |
+|---|---|---|
+| Python backend | `uv` | Fast dependency install in Docker |
+| Node.js frontend | `pnpm` | Fast, strict, deterministic lockfile |
